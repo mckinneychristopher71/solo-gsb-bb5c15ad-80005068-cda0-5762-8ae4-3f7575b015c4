@@ -43,6 +43,12 @@
 并在库存内选择满足需求且**原纸总面积最小**的组合（面积并列时依次比超产最少、按输入顺序的用量字典序最小），
 返回各规格用量、单张出数、总产量与余量；库存满负荷仍无法满足需求时返回明确的 422。
 
+还提供**安全距离检查**接口 `/api/v1/impose/trim-safety`：沿用机台版面的全部参数与页位坐标，
+按实际页码接收阅读方向的受保护内容矩形列表，以及非负的外裁、折缝安全距离（mm）；
+逐张逐面按页位的 0°/180° 旋转把矩形映射到纸面，中缝侧按折缝距离、其余三边按外裁距离核查
+（贴安全线视为合格），返回每处越线的帖号、张号、正反面、页码、违规边与纸面矩形；
+矩形越出页内返回 422，空白页位自动跳过。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -89,6 +95,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 - 订针计划接口：`POST http://localhost:8000/api/v1/impose/staple-plan`
 - 原纸备料接口：`POST http://localhost:8000/api/v1/impose/stock-plan`
+- 安全距离检查接口：`POST http://localhost:8000/api/v1/impose/trim-safety`
 
 ## 接口说明
 
@@ -823,6 +830,128 @@ curl -X POST http://localhost:8000/api/v1/impose/stock-plan \
   满负荷产能与总需求，例如
   `Value error, 库存原纸满负荷最多产出 30 张成品印张，无法满足总需求 100 张（每册 1 张 × 印数 100）`。
 
+## 安全距离检查（POST /api/v1/impose/trim-safety）
+
+在机台版面的**相同分帖、页序、槽位与旋转规则**之上，把各页**阅读方向的受保护内容矩形**
+（如重要图文、条码区域）映射到纸面，核查它们是否压到外裁 / 折缝的安全线，用于印前检查。
+本地访问地址 `http://localhost:8000/api/v1/impose/trim-safety`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/trim-safety`，`Content-Type: application/json`
+
+机台版面的全部参数原样沿用（`total_pages` / `max_sheets_per_signature` / `binding` /
+`page_width_mm` / `page_height_mm` / `gutter_mm` / `duplex_flip`，约束相同），另加：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `trim_margin_mm` | 数值 | 非负数（有限值） | **外裁安全距离**（mm）；页位的上、下与外缘三边按此检查 |
+| `fold_margin_mm` | 数值 | 非负数（有限值） | **折缝安全距离**（mm）；页位的中缝侧按此检查 |
+| `page_contents` | 对象数组 | 允许为空 | 各页的受保护内容矩形；**空白页无需给出** |
+| `page_contents[].page` | 整数 | 1～`total_pages`，同页只能出现一次 | 页码 |
+| `page_contents[].rectangles` | 对象数组 | 非空 | 该页阅读方向的受保护内容矩形，**完整落在页面内**（允许贴边） |
+| `rectangles[].x_mm` / `y_mm` | 数值 | ≥ 0、有限值 | 矩形**左上角**在页内的坐标（mm），以**页面左上角**为原点、向右/向下为正（阅读方向） |
+| `rectangles[].width_mm` / `height_mm` | 数值 | 正数、有限值 | 矩形宽、高（mm）；`x + width ≤ page_width_mm`、`y + height ≤ page_height_mm` |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/trim-safety \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210,
+    "page_height_mm": 297,
+    "gutter_mm": 10,
+    "duplex_flip": "long",
+    "trim_margin_mm": 5,
+    "fold_margin_mm": 8,
+    "page_contents": [
+      {"page": 1, "rectangles": [
+        {"x_mm": 0, "y_mm": 5, "width_mm": 100, "height_mm": 200}
+      ]},
+      {"page": 4, "rectangles": [
+        {"x_mm": 3, "y_mm": 10, "width_mm": 50, "height_mm": 50}
+      ]}
+    ]
+  }'
+```
+
+### 映射与检查规则
+
+- **页位映射**：每个页内矩形按其页码所在页位（与机台版面完全一致：分帖、左/右装订镜像、
+  `long` 背面交换槽位、`short` 背面保持槽位）映射到纸面：
+  - 页位旋转 `0°`（正面与 `long` 背面）：纸面矩形左上角 = 槽位左上角 + 页内左上角，宽高不变；
+  - 页位旋转 `180°`（`short` 背面）：绕页位中心旋转——
+    纸面左上角 = `(槽位 x + 页宽 − x − width, 页高 − y − height)`，宽高不变。
+- **安全线**：页位在纸面上的四条边中，**中缝侧**（左槽的右边、右槽的左边）按
+  `fold_margin_mm` 检查，**其余三边**（上、下与外缘）按 `trim_margin_mm` 检查。
+  矩形边缘到页位边的距离**小于**对应安全距离即为越线；**恰好贴上安全线**
+  （距离等于安全距离）视为合格。安全距离为 `0` 时，矩形贴满页边也合格。
+- **空白页跳过**：末帖补齐的空白页位不参与检查；未给出内容矩形的页也不产生越线。
+- **返回顺序**：按帖号、张号、正反面（`front` 先于 `back`）、槽位（左先于右）、
+  页内矩形顺序逐边（左、右、上、下）返回；同一矩形压多条边时逐边各返回一条。
+
+### 响应
+
+顶层回显机台版面参数、纸面尺寸与两个安全距离；`violation_count` 为越线处总数，
+`violations` 逐处给出 `signature_index`（帖号）、`sheet_index`（张号，1 为最外张）、
+`side`（`front` / `back`）、`page`（原稿页码）、`edge`（违规边，纸面方向上页位的
+`left` / `right` / `top` / `bottom`；左槽中缝侧为 `right`、右槽中缝侧为 `left`）
+与 `rect`（映射后的纸面矩形：`x_mm` / `y_mm` / `width_mm` / `height_mm`）。
+
+上例（4 页、左装订、纸面 430 × 297）中：第 4 页在正面左槽（x=0），页内 `(3,10,50,50)`
+的外缘（左）距离 3 < 5 越线；第 1 页在正面右槽（x=220），页内 `(0,5,100,200)` 映射到
+纸面 `(220,5,100,200)`，中缝侧（左）距离 0 < 8 越线（其上边距离恰为 5，贴线合格）：
+
+```json
+{
+  "total_pages": 4,
+  "max_sheets_per_signature": 1,
+  "binding": "left",
+  "page_width_mm": 210.0,
+  "page_height_mm": 297.0,
+  "gutter_mm": 10.0,
+  "duplex_flip": "long",
+  "trim_margin_mm": 5.0,
+  "fold_margin_mm": 8.0,
+  "paper_width_mm": 430.0,
+  "paper_height_mm": 297.0,
+  "violation_count": 2,
+  "violations": [
+    {
+      "signature_index": 1,
+      "sheet_index": 1,
+      "side": "front",
+      "page": 4,
+      "edge": "left",
+      "rect": { "x_mm": 3.0, "y_mm": 10.0, "width_mm": 50.0, "height_mm": 50.0 }
+    },
+    {
+      "signature_index": 1,
+      "sheet_index": 1,
+      "side": "front",
+      "page": 1,
+      "edge": "left",
+      "rect": { "x_mm": 220.0, "y_mm": 5.0, "width_mm": 100.0, "height_mm": 200.0 }
+    }
+  ]
+}
+```
+
+### 非法参数（4xx）
+
+机台版面参数的校验与 `/api/v1/impose/press-layout` 完全一致；此外：
+
+- `trim_margin_mm` / `fold_margin_mm` 为负数或非有限值（`NaN` / `Infinity`）；
+- **页码无效**：`page_contents[].page` 小于 1、超过 `total_pages`（或非整数），
+  或同一页码出现两次；
+- **矩形越出页内**：`x_mm` / `y_mm` 为负或非有限值、`width_mm` / `height_mm` 非正或
+  非有限值、`x + width > page_width_mm` 或 `y + height > page_height_mm`；
+- 矩形/页缺字段或含未定义字段；
+
+以上均返回 `422 Unprocessable Entity`。
+
 ## 章节分帖拼版（POST /api/v1/impose/chapters）
 在 `/api/v1/impose` 的基础上支持**章节感知**分帖：章节不可跨帖，相邻章节可合帖。
 本地访问地址 `http://localhost:8000/api/v1/impose/chapters`（改了 `HOST_PORT` 则对应替换端口）。
@@ -1151,7 +1280,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 订针计划 + 原纸备料）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 安全距离检查 + 订针计划 + 原纸备料）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验

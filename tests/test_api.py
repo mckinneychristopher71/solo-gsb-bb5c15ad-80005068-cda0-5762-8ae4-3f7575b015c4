@@ -2096,3 +2096,231 @@ def test_stock_plan_exact_edge_fit_still_counts():
     assert paper["pieces_per_sheet"] == 6
     assert paper["columns"] == 3 and paper["rows"] == 2
 
+
+
+# ---------------------------------------------------------------------------
+# 安全距离检查 /api/v1/impose/trim-safety
+# ---------------------------------------------------------------------------
+
+TRIM_SAFETY_BASE = {
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 100.0,
+    "page_height_mm": 100.0,
+    "gutter_mm": 0.0,
+    "duplex_flip": "long",
+    "trim_margin_mm": 5.0,
+    "fold_margin_mm": 8.0,
+    "page_contents": [],
+}
+
+
+def test_trim_safety_no_violations():
+    body = {
+        **TRIM_SAFETY_BASE,
+        # 第 4 页正面左槽：四周均留 10 mm，安全距离 5/8 全部满足
+        "page_contents": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 10, "y_mm": 10, "width_mm": 20, "height_mm": 20},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["paper_width_mm"] == 200.0
+    assert data["paper_height_mm"] == 100.0
+    assert data["trim_margin_mm"] == 5.0
+    assert data["fold_margin_mm"] == 8.0
+    assert data["violation_count"] == 0
+    assert data["violations"] == []
+
+
+def test_trim_safety_reports_trim_and_fold_edges():
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_contents": [
+            # 第 4 页正面左槽：页内 (0,10,20,20) 外缘（左）距离 0 < 5；
+            # 页内 (80,10,20,20) 中缝侧（右）距离 0 < 折缝 8
+            {"page": 4, "rectangles": [
+                {"x_mm": 0, "y_mm": 10, "width_mm": 20, "height_mm": 20},
+                {"x_mm": 80, "y_mm": 10, "width_mm": 20, "height_mm": 20},
+            ]},
+            # 第 1 页正面右槽（x=100）：页内 (0,10,20,20) 中缝侧（左）距离 0 < 8
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 10, "width_mm": 20, "height_mm": 20},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["violation_count"] == 3
+    assert data["violations"] == [
+        {
+            "signature_index": 1,
+            "sheet_index": 1,
+            "side": "front",
+            "page": 4,
+            "edge": "left",
+            "rect": {"x_mm": 0.0, "y_mm": 10.0, "width_mm": 20.0, "height_mm": 20.0},
+        },
+        {
+            "signature_index": 1,
+            "sheet_index": 1,
+            "side": "front",
+            "page": 4,
+            "edge": "right",
+            "rect": {"x_mm": 80.0, "y_mm": 10.0, "width_mm": 20.0, "height_mm": 20.0},
+        },
+        {
+            "signature_index": 1,
+            "sheet_index": 1,
+            "side": "front",
+            "page": 1,
+            "edge": "left",
+            "rect": {"x_mm": 100.0, "y_mm": 10.0, "width_mm": 20.0, "height_mm": 20.0},
+        },
+    ]
+
+
+def test_trim_safety_touching_safety_line_passes():
+    body = {
+        **TRIM_SAFETY_BASE,
+        # 左槽：左 5、右（中缝侧）8、上 5、下 5，恰好贴安全线 -> 合格
+        "page_contents": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 5, "y_mm": 5, "width_mm": 87, "height_mm": 90},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    assert response.json()["violations"] == []
+
+
+def test_trim_safety_short_flip_back_rotated_180():
+    body = {
+        **TRIM_SAFETY_BASE,
+        "duplex_flip": "short",
+        # short 背面背左 = 第 2 页（x=0）旋转 180：
+        # 页内 (0,0,10,10) -> 纸面 (90,90,10,10)，中缝侧（右）0 < 8、底边 0 < 5
+        "page_contents": [
+            {"page": 2, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert [(v["side"], v["page"], v["edge"]) for v in data["violations"]] == [
+        ("back", 2, "right"),
+        ("back", 2, "bottom"),
+    ]
+    assert data["violations"][0]["rect"] == {
+        "x_mm": 90.0,
+        "y_mm": 90.0,
+        "width_mm": 10.0,
+        "height_mm": 10.0,
+    }
+
+
+def test_trim_safety_blank_pages_skipped():
+    # 1 页补 3 空白：仅第 1 页（正面右槽 x=100）参与检查，空白页位跳过
+    body = {
+        **TRIM_SAFETY_BASE,
+        "total_pages": 1,
+        "page_contents": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert [(v["side"], v["page"], v["edge"]) for v in data["violations"]] == [
+        ("front", 1, "left"),
+        ("front", 1, "top"),
+    ]
+
+
+def test_trim_safety_rect_out_of_page_returns_422():
+    for rect in (
+        {"x_mm": -1, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+        {"x_mm": 0, "y_mm": 0, "width_mm": 101, "height_mm": 10},
+        {"x_mm": 95, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+        {"x_mm": 0, "y_mm": 95, "width_mm": 10, "height_mm": 10},
+        {"x_mm": 0, "y_mm": 0, "width_mm": 0, "height_mm": 10},
+        {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": -1},
+    ):
+        body = {
+            **TRIM_SAFETY_BASE,
+            "page_contents": [{"page": 1, "rectangles": [rect]}],
+        }
+        response = client.post("/api/v1/impose/trim-safety", json=body)
+        assert response.status_code == 422
+
+
+def test_trim_safety_invalid_margins_return_422():
+    for field in ("trim_margin_mm", "fold_margin_mm"):
+        for value in (-0.5, "NaN", "Infinity"):
+            body = {**TRIM_SAFETY_BASE, field: value}
+            response = client.post("/api/v1/impose/trim-safety", json=body)
+            assert response.status_code == 422
+
+
+def test_trim_safety_invalid_page_returns_422():
+    for page in (0, 5, 1.5, True):
+        body = {
+            **TRIM_SAFETY_BASE,
+            "page_contents": [
+                {"page": page, "rectangles": [
+                    {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+                ]},
+            ],
+        }
+        response = client.post("/api/v1/impose/trim-safety", json=body)
+        assert response.status_code == 422
+    # 同一页码重复给出
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_contents": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+            ]},
+            {"page": 1, "rectangles": [
+                {"x_mm": 20, "y_mm": 20, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 422
+
+
+def test_trim_safety_non_finite_rect_returns_422():
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_contents": [
+            {"page": 1, "rectangles": [
+                {"x_mm": "NaN", "y_mm": 0, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 422
+
+
+def test_trim_safety_unknown_field_rejected():
+    body = {**TRIM_SAFETY_BASE, "unexpected": 1}
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 422
+
+
+def test_trim_safety_missing_field():
+    for field in ("total_pages", "trim_margin_mm", "fold_margin_mm", "page_contents"):
+        body = {key: value for key, value in TRIM_SAFETY_BASE.items() if key != field}
+        response = client.post("/api/v1/impose/trim-safety", json=body)
+        assert response.status_code == 422
