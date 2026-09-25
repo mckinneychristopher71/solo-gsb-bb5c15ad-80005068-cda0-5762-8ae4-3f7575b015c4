@@ -1653,6 +1653,346 @@ def test_ink_zones_missing_field_returns_422():
 
 
 # ---------------------------------------------------------------------------
+# 外裁/折缝安全检查 /api/v1/impose/trim-safety
+# ---------------------------------------------------------------------------
+
+TRIM_SAFETY_BASE = {
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 100.0,
+    "page_height_mm": 100.0,
+    "gutter_mm": 0.0,
+    "duplex_flip": "long",
+    "outer_trim_mm": 10.0,
+    "fold_safety_mm": 5.0,
+    "page_protected": [],
+}
+
+
+def test_trim_safety_no_violations_echoes_parameters():
+    response = client.post("/api/v1/impose/trim-safety", json=TRIM_SAFETY_BASE)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["paper_width_mm"] == 200.0
+    assert data["paper_height_mm"] == 100.0
+    assert data["outer_trim_mm"] == 10.0
+    assert data["fold_safety_mm"] == 5.0
+    assert data["violation_count"] == 0
+    assert data["violations"] == []
+
+
+def test_trim_safety_fold_and_top_violations():
+    # 第 1 页右槽 x=100，折缝线 100：
+    # 矩形 A 页内 (0,50,10,10) -> 纸面 100..110，左缘越折缝安全线 105
+    # 矩形 B 页内 (50,0,10,5) -> 纸面 150..,y 0..5，越顶边安全线 10
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 50, "width_mm": 10, "height_mm": 10},
+                {"x_mm": 50, "y_mm": 0, "width_mm": 10, "height_mm": 5},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["violation_count"] == 2
+    fold, top = data["violations"]
+    assert fold["signature_index"] == 1
+    assert fold["sheet_index"] == 1
+    assert fold["side"] == "front"
+    assert fold["page"] == 1
+    assert fold["edge"] == "fold"
+    assert fold["rectangle"] == {
+        "x_mm": 100.0, "y_mm": 50.0, "width_mm": 10.0, "height_mm": 10.0
+    }
+    assert top["edge"] == "top"
+    assert top["rectangle"]["x_mm"] == 150.0
+
+
+def test_trim_safety_touching_safe_line_passes():
+    # 矩形左缘恰好落在折缝安全线上（纸面 105）合格
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 5, "y_mm": 50, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    assert response.json()["violations"] == []
+
+
+def test_trim_safety_all_four_edges_reported_in_order():
+    # 左槽第 4 页整页出血矩形：四边全越，顺序 top,bottom,outer,fold
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 100, "height_mm": 100},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    edges = [v["edge"] for v in response.json()["violations"]]
+    assert edges == ["top", "bottom", "outer", "fold"]
+
+
+def test_trim_safety_long_back_swapped_slots():
+    # long 背面右槽 = 第 2 页（x=100），页内 0..5 -> 纸面 100..105 越折缝线
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 2, "rectangles": [
+                {"x_mm": 0, "y_mm": 50, "width_mm": 5, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    violations = response.json()["violations"]
+    assert [(v["side"], v["page"], v["edge"]) for v in violations] == [
+        ("back", 2, "fold")
+    ]
+
+
+def test_trim_safety_short_back_rotates_180():
+    # short 背面背左 = 第 2 页（x=0）旋转 180：
+    # 页内右下角 (90,90,10,10) -> 纸面 (0,0,10,10)，越 top 与 outer
+    body = {
+        **TRIM_SAFETY_BASE,
+        "duplex_flip": "short",
+        "page_protected": [
+            {"page": 2, "rectangles": [
+                {"x_mm": 90, "y_mm": 90, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    violations = response.json()["violations"]
+    assert [v["edge"] for v in violations] == ["top", "outer"]
+    assert violations[0]["rectangle"] == {
+        "x_mm": 0.0, "y_mm": 0.0, "width_mm": 10.0, "height_mm": 10.0
+    }
+
+
+def test_trim_safety_right_binding_mirrored():
+    # 右装订正面左槽 = 第 1 页：页内 0..5 -> 纸面 0..5 越外侧
+    body = {
+        **TRIM_SAFETY_BASE,
+        "binding": "right",
+        "page_protected": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 50, "width_mm": 5, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    violations = response.json()["violations"]
+    assert [(v["page"], v["edge"]) for v in violations] == [(1, "outer")]
+
+
+def test_trim_safety_blank_pages_skipped():
+    # 1 页补 3 空白：背面全为空白页位，跳过；只检查正面第 1 页
+    body = {
+        **TRIM_SAFETY_BASE,
+        "total_pages": 1,
+        "page_protected": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 50, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    sides = {v["side"] for v in response.json()["violations"]}
+    assert sides == {"front"}
+
+
+def test_trim_safety_multi_signature_ordering():
+    # 6 页每帖 1 张，第 1、5 页各给越折缝矩形；帖 1 的违规排在帖 2 之前
+    body = {
+        **TRIM_SAFETY_BASE,
+        "total_pages": 6,
+        "page_protected": [
+            {"page": page, "rectangles": [
+                {"x_mm": 0, "y_mm": 50, "width_mm": 10, "height_mm": 10},
+            ]}
+            # 第 1 页与第 5 页都在正面右槽
+            for page in (5, 1)
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    violations = response.json()["violations"]
+    # 输出按帖/张/面/槽顺序，与请求中页的给出顺序无关
+    assert [(v["signature_index"], v["page"]) for v in violations] == [
+        (1, 1), (2, 5)
+    ]
+
+
+def test_trim_safety_zero_distances_full_bleed_passes():
+    body = {
+        **TRIM_SAFETY_BASE,
+        "outer_trim_mm": 0,
+        "fold_safety_mm": 0,
+        "page_protected": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 100, "height_mm": 100},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+    assert response.json()["violation_count"] == 0
+
+
+def test_trim_safety_rect_out_of_page_returns_422():
+    for rect in (
+        {"x_mm": -1, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+        {"x_mm": 0, "y_mm": 0, "width_mm": 101, "height_mm": 10},
+        {"x_mm": 95, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+        {"x_mm": 0, "y_mm": 0, "width_mm": 0, "height_mm": 10},
+    ):
+        body = {
+            **TRIM_SAFETY_BASE,
+            "page_protected": [{"page": 1, "rectangles": [rect]}],
+        }
+        assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+
+
+def test_trim_safety_invalid_page_number_returns_422():
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 5, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+            ]},
+        ],
+    }
+    assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+
+
+def test_trim_safety_duplicate_page_returns_422():
+    rect = {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10}
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 1, "rectangles": [rect]},
+            {"page": 1, "rectangles": [rect]},
+        ],
+    }
+    assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+
+
+def test_trim_safety_page_must_be_integer():
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": True, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 1, "height_mm": 1},
+            ]},
+        ],
+    }
+    assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+
+
+def test_trim_safety_negative_distances_return_422():
+    for override in (
+        {"outer_trim_mm": -1},
+        {"fold_safety_mm": -0.5},
+    ):
+        body = {**TRIM_SAFETY_BASE, **override}
+        assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+
+
+def test_trim_safety_non_finite_values_return_422():
+    # outer_trim_mm 为 NaN
+    payload = (
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": 100, "page_height_mm": 100, "gutter_mm": 0, '
+        '"duplex_flip": "long", "outer_trim_mm": NaN, "fold_safety_mm": 5, '
+        '"page_protected": []}'
+    )
+    response = client.post(
+        "/api/v1/impose/trim-safety",
+        content=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    # 矩形宽为 Infinity
+    payload = (
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": 100, "page_height_mm": 100, "gutter_mm": 0, '
+        '"duplex_flip": "long", "outer_trim_mm": 10, "fold_safety_mm": 5, '
+        '"page_protected": [{"page": 1, "rectangles": [{"x_mm": 0, "y_mm": 0, '
+        '"width_mm": Infinity, "height_mm": 10}]}]}'
+    )
+    response = client.post(
+        "/api/v1/impose/trim-safety",
+        content=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_trim_safety_layout_validation_reused():
+    rect = {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10}
+    for override in (
+        {"page_width_mm": 0},
+        {"page_height_mm": -1},
+        {"gutter_mm": -0.5},
+        {"duplex_flip": "side"},
+        {"binding": "top"},
+        {"total_pages": 0},
+    ):
+        body = {
+            **TRIM_SAFETY_BASE, **override,
+            "page_protected": [{"page": 1, "rectangles": [rect]}],
+        }
+        assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+    body = {**TRIM_SAFETY_BASE, "extra": 1}
+    assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+
+
+def test_trim_safety_missing_field_returns_422():
+    body = dict(TRIM_SAFETY_BASE)
+    del body["fold_safety_mm"]
+    assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "height_mm": 10},
+            ]},
+        ],
+    }
+    assert client.post("/api/v1/impose/trim-safety", json=body).status_code == 422
+
+
+def test_trim_safety_overlapping_rectangles_allowed():
+    # 同页矩形允许正面积交叠（不影响安全判定）
+    body = {
+        **TRIM_SAFETY_BASE,
+        "page_protected": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 40, "y_mm": 40, "width_mm": 30, "height_mm": 30},
+                {"x_mm": 50, "y_mm": 50, "width_mm": 30, "height_mm": 30},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/trim-safety", json=body)
+    assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # 订针计划 /api/v1/impose/staple-plan
 # ---------------------------------------------------------------------------
 

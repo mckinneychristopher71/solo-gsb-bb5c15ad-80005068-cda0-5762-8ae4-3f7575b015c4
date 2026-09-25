@@ -19,6 +19,7 @@ from .imposition import (
     plan_stock,
     press_layout,
     staple_plan,
+    trim_safety,
     UNREAD,
 )
 from .proof import (
@@ -43,6 +44,9 @@ app = FastAPI(
         "与阅读方向的页内坐标，中缝与空白页位单独标记。"
         "支持墨区着墨面积：页内矩形随页位 0°/180° 方向映射到纸面，跨等宽墨区"
         "按交叠面积拆分，按帖/张/正反面/墨区给出 CMYK 各通道等效着墨面积乘印数。"
+        "支持外裁/折缝安全检查：按实际页码给出阅读方向的受保护内容矩形，映射到纸面后"
+        "逐张逐面核对中缝侧折缝安全距离与其余三边外裁安全距离（贴安全线合格），"
+        "逐处返回帖号/张号/正反面/页码/违规边/纸面矩形，空白页位跳过。"
         "支持双面拼版校样：按机台版面输出可下载的 proof.pdf。"
         "支持订针计划：沿用分帖结果，在页高整数毫米刻度上避开留边与按帖禁针闭区间，"
         "以最大绝对偏差最小（并列再比偏差总和、针位字典序）为每帖规划递增订针针位。"
@@ -52,7 +56,7 @@ app = FastAPI(
         "恰好贴边仍可排入），给出各规格单张出数，并在库存内选择总面积最小"
         "（并列再比超产、用量字典序）的原纸组合。"
     ),
-    version="1.9.1",
+    version="1.10.0",
 )
 
 
@@ -437,6 +441,161 @@ class InkZonesResponse(BaseModel):
     copies: int = Field(..., description="印数（正整数），各通道结果已乘该印数")
     signature_count: int
     signatures: list[InkZonesSignature]
+
+
+# ---------------------------------------------------------------------------
+# 外裁/折缝安全检查 /api/v1/impose/trim-safety
+# ---------------------------------------------------------------------------
+
+
+class ProtectedRectangle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x_mm: float = Field(
+        ..., description="矩形左上角 x（mm），以页面左上角为原点、向右为正"
+    )
+    y_mm: float = Field(
+        ..., description="矩形左上角 y（mm），以页面左上角为原点、向下为正"
+    )
+    width_mm: float = Field(..., description="矩形宽（mm），正数")
+    height_mm: float = Field(..., description="矩形高（mm），正数")
+
+    @field_validator("x_mm", "y_mm", "width_mm", "height_mm")
+    @classmethod
+    def validate_finite_rect(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("矩形坐标与宽高必须为有限数值（单位 mm）")
+        return value
+
+    @field_validator("width_mm", "height_mm")
+    @classmethod
+    def validate_positive_rect(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("矩形宽、高必须为正数")
+        return value
+
+
+class PageProtected(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    page: int = Field(..., ge=1, description="页码，从 1 开始；同一页码只能出现一次")
+    rectangles: list[ProtectedRectangle] = Field(
+        ..., min_length=1, description="该页阅读方向的受保护内容矩形列表，完整落在页面内（允许贴边）"
+    )
+
+    @field_validator("page", mode="before")
+    @classmethod
+    def reject_non_integer_page(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("页码必须为整数（不接受布尔值或小数）")
+        return value
+
+
+class TrimSafetyRequest(PressLayoutRequest):
+    """外裁/折缝安全检查请求：机台版面全部参数 + 安全距离与各页受保护矩形。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outer_trim_mm: float = Field(
+        ..., description="外裁安全距离（mm），非负有限数值；用于中缝以外的三边"
+    )
+    fold_safety_mm: float = Field(
+        ..., description="折缝安全距离（mm），非负有限数值；用于中缝侧"
+    )
+    page_protected: list[PageProtected] = Field(
+        ...,
+        description=(
+            "按实际页码给出的各页阅读方向受保护内容矩形；页码有效、同页只出现一次、"
+            "矩形完整落在页面内；空白页无需给出；列表可为空（无受保护内容）"
+        ),
+    )
+
+    @field_validator("outer_trim_mm", "fold_safety_mm")
+    @classmethod
+    def validate_non_negative_safety_mm(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("外裁、折缝安全距离必须为非负数（有限数值，单位 mm）")
+        return value
+
+    @model_validator(mode="after")
+    def validate_trim_safety(self) -> "TrimSafetyRequest":
+        # 页码有效性、同页重复、矩形越界由 trim_safety 统一校验，
+        # 失败抛 ValueError -> 422；响应结果在端点内重新计算
+        trim_safety(
+            total_pages=self.total_pages,
+            max_sheets=self.max_sheets_per_signature,
+            binding=self.binding,
+            page_width_mm=self.page_width_mm,
+            page_height_mm=self.page_height_mm,
+            gutter_mm=self.gutter_mm,
+            duplex_flip=self.duplex_flip,
+            outer_trim_mm=self.outer_trim_mm,
+            fold_safety_mm=self.fold_safety_mm,
+            page_protected=[
+                (
+                    item.page,
+                    [
+                        (rect.x_mm, rect.y_mm, rect.width_mm, rect.height_mm)
+                        for rect in item.rectangles
+                    ],
+                )
+                for item in self.page_protected
+            ],
+        )
+        return self
+
+
+class PaperRectangle(BaseModel):
+    x_mm: float = Field(
+        ..., description="纸面矩形左上角 x（mm），以纸面左上角为原点、向右为正"
+    )
+    y_mm: float = Field(
+        ..., description="纸面矩形左上角 y（mm），以纸面左上角为原点、向下为正"
+    )
+    width_mm: float = Field(..., description="纸面矩形宽（mm）")
+    height_mm: float = Field(..., description="纸面矩形高（mm）")
+
+
+class TrimSafetyViolation(BaseModel):
+    signature_index: int = Field(..., description="帖号，从 1 开始")
+    sheet_index: int = Field(..., description="帖内张号，从 1 开始（1 为最外张）")
+    side: Literal["front", "back"] = Field(
+        ..., description="正反面：front=正面，back=背面"
+    )
+    page: int = Field(..., description="违规矩形所属原稿页码（从 1 开始）")
+    edge: Literal["top", "bottom", "outer", "fold"] = Field(
+        ...,
+        description=(
+            "违规边：top=纸面顶边（外裁），bottom=纸面底边（外裁），"
+            "outer=纸面外侧竖边（左槽靠左缘、右槽靠右缘，外裁），"
+            "fold=中缝折缝侧（折缝安全距离）"
+        ),
+    )
+    rectangle: PaperRectangle = Field(
+        ..., description="受保护矩形按页位 0°/180° 映射后的纸面矩形"
+    )
+
+
+class TrimSafetyResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    duplex_flip: Literal["long", "short"]
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    outer_trim_mm: float = Field(..., description="外裁安全距离（mm）")
+    fold_safety_mm: float = Field(..., description="折缝安全距离（mm）")
+    violation_count: int = Field(..., description="越线违规总数")
+    violations: list[TrimSafetyViolation] = Field(
+        ...,
+        description=(
+            "逐处越线明细，按帖号、张号、正反面、左右槽与请求矩形顺序排列；"
+            "同一矩形越过多条安全线时逐边各记一条（top、bottom、outer、fold）"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1109,6 +1268,40 @@ def create_ink_zones(request: InkZonesRequest) -> InkZonesResponse:
         ],
     )
     return InkZonesResponse(**result)
+
+
+@app.post(
+    "/api/v1/impose/trim-safety",
+    response_model=TrimSafetyResponse,
+    tags=["拼版"],
+    summary="外裁/折缝安全检查：受保护内容映射纸面后核对安全距离",
+    responses={
+        422: {"description": "参数非法，或受保护矩形越出页面（错误信息指出页码与矩形）"},
+    },
+)
+def create_trim_safety(request: TrimSafetyRequest) -> TrimSafetyResponse:
+    result = trim_safety(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+        outer_trim_mm=request.outer_trim_mm,
+        fold_safety_mm=request.fold_safety_mm,
+        page_protected=[
+            (
+                item.page,
+                [
+                    (rect.x_mm, rect.y_mm, rect.width_mm, rect.height_mm)
+                    for rect in item.rectangles
+                ],
+            )
+            for item in request.page_protected
+        ],
+    )
+    return TrimSafetyResponse(**result)
 
 
 @app.post(

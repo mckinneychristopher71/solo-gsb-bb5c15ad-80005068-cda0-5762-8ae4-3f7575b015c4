@@ -26,6 +26,12 @@
 0°/180° 方向映射到纸面，跨墨区按交叠面积拆分，按帖、张、正反面和墨区返回各通道**等效着墨面积乘印数**
 后的结果（mm²），空白页不计。
 
+还提供**外裁/折缝安全检查**接口 `/api/v1/impose/trim-safety`：沿用机台版面的全部参数，另给非负的
+外裁安全距离与折缝安全距离，并按**实际页码**给出**阅读方向**的受保护内容矩形列表；矩形越出页内返回
+422。逐张逐面按页位的 0°/180° 旋转把矩形映射到纸面，中缝侧按折缝距离、其余三边（顶/底/纸面外侧）
+按外裁距离检查，**贴安全线视为合格**；逐处返回帖号、张号、正反面、页码、违规边（`top`/`bottom`/
+`outer`/`fold`）与纸面矩形，空白页跳过。
+
 还提供**双面拼版校样**接口 `/api/v1/impose/proof.pdf`：参数与机台版面完全一致，直接返回可下载的
 `proof.pdf`——每张印张依次生成正面、背面两页，纸面尺寸与机台版面一致，各页位标注页码、帖号与张号，
 空白位标注“空白”，并画出中缝分隔线；长边 / 短边翻转的背面分别按槽位交换、旋转 180° 呈现。
@@ -86,6 +92,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 机台版面接口：`POST http://localhost:8000/api/v1/impose/press-layout`
 - 瑕疵定位接口：`POST http://localhost:8000/api/v1/impose/locate-defects`
 - 墨区着墨面积接口：`POST http://localhost:8000/api/v1/impose/ink-zones`
+- 外裁/折缝安全检查接口：`POST http://localhost:8000/api/v1/impose/trim-safety`
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 - 订针计划接口：`POST http://localhost:8000/api/v1/impose/staple-plan`
 - 原纸备料接口：`POST http://localhost:8000/api/v1/impose/stock-plan`
@@ -490,6 +497,126 @@ curl -X POST http://localhost:8000/api/v1/impose/ink-zones \
 - 任一通道覆盖率不在 0～1、矩形/页缺字段或含未定义字段；
 
 以上均返回 `422 Unprocessable Entity`。
+
+## 外裁/折缝安全检查（POST /api/v1/impose/trim-safety）
+
+在机台版面的**相同分帖、页序、槽位与旋转规则**之上，把各页**阅读方向**的受保护内容矩形映射到纸面，
+逐张逐面核对其与**外裁边**、**折缝**的安全距离，用于上机前检查重要内容（文字、二维码、人脸等）是否
+会被裁掉或压到折缝。本地访问地址 `http://localhost:8000/api/v1/impose/trim-safety`
+（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/trim-safety`，`Content-Type: application/json`
+
+机台版面的全部参数原样沿用（`total_pages` / `max_sheets_per_signature` / `binding` /
+`page_width_mm` / `page_height_mm` / `gutter_mm` / `duplex_flip`，约束相同），另加：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `outer_trim_mm` | 数值 | ≥ 0（有限值） | **外裁安全距离**（mm）；用于中缝以外的三边 |
+| `fold_safety_mm` | 数值 | ≥ 0（有限值） | **折缝安全距离**（mm）；用于中缝侧 |
+| `page_protected` | 对象数组 | 允许为空 | 按**实际页码**给出的各页受保护内容矩形；**空白页无需给出** |
+| `page_protected[].page` | 整数 | 1～`total_pages`，同页只能出现一次 | 页码 |
+| `page_protected[].rectangles` | 对象数组 | 非空 | 该页阅读方向的受保护矩形，**完整落在页面内**（允许贴边）；同页矩形允许相互交叠 |
+| `rectangles[].x_mm` / `y_mm` | 数值 | ≥ 0、有限值 | 矩形**左上角**在页内的坐标（mm），以**页面左上角**为原点、向右/向下为正 |
+| `rectangles[].width_mm` / `height_mm` | 数值 | 正数、有限值 | 矩形宽、高（mm）；`x + width ≤ page_width_mm`、`y + height ≤ page_height_mm` |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/trim-safety \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210,
+    "page_height_mm": 297,
+    "gutter_mm": 0,
+    "duplex_flip": "long",
+    "outer_trim_mm": 3,
+    "fold_safety_mm": 7,
+    "page_protected": [
+      {"page": 1, "rectangles": [
+        {"x_mm": 10, "y_mm": 20, "width_mm": 120, "height_mm": 60}
+      ]},
+      {"page": 4, "rectangles": [
+        {"x_mm": 0, "y_mm": 0, "width_mm": 210, "height_mm": 297}
+      ]}
+    ]
+  }'
+```
+
+### 映射与检查规则
+
+- **页位映射**：每个受保护矩形按其页码所在页位（与机台版面完全一致：分帖、左/右装订镜像、
+  `long` 背面交换槽位、`short` 背面保持槽位并旋转 180°）映射到纸面坐标：
+  - 页位旋转 `0°`（正面与 `long` 背面）：纸面矩形左上角 = 槽位左上角 + 页内左上角，宽高不变；
+  - 页位旋转 `180°`（`short` 背面）：绕页位中心旋转——
+    纸面左上角 = `(槽位 x + 页宽 − x − width, 页高 − y − height)`，宽高不变。
+- **折缝线**：纸面（中缝）中心线 `paper_width_mm / 2 = page_width_mm + gutter_mm / 2`。
+- **四条安全线**（矩形边与安全线比较，**贴线视为合格**，仅严格越线才记违规）：
+  - **中缝侧**（`edge = "fold"`）：左槽看矩形**右边**、右槽看矩形**左边**，
+    与折缝线保持 `fold_safety_mm`；
+  - **其余三边**按 `outer_trim_mm`：纸面**顶边**（`edge = "top"`）、
+    纸面**底边**（`edge = "bottom"`），以及**纸面外侧竖边**（`edge = "outer"`，
+    左槽看靠左纸边的矩形左边、右槽看靠右纸边的矩形右边）。
+- **空白页跳过**：末帖补齐的空白页位不参与检查，请求中也不需要给空白页内容；
+  `page_protected` 为空（所有页都没有受保护内容）时违规列表为空。
+- 一个矩形同时越过多条安全线时，**逐边各记一条**违规，同一矩形的边顺序固定为
+  `top`、`bottom`、`outer`、`fold`；整体按帖号、张号、正反面（front → back）、
+  左右槽与请求中的矩形顺序排列。
+
+### 响应
+
+顶层回显机台版面参数、纸面尺寸、两个安全距离与 `violation_count`；`violations` 逐处给出帖号
+`signature_index`、张号 `sheet_index`（1 为最外张）、正反面 `side`、原稿页码 `page`、
+违规边 `edge` 与映射后的**纸面矩形** `rectangle`（左上角坐标与宽高，mm，纸面左上角为原点）。
+
+上例（纸面 420 × 297、无中缝、折缝线 x=210、左装订）：
+
+- 第 1 页在正面右槽（槽位 x=210），页内 `(10,20,120,60)` 映射到纸面 `(220,20,120,60)`：
+  左缘 220 距折缝线 10 mm ≥ 7，其余三边距纸边也都 ≥ 3，**不违规**；
+- 第 4 页在正面左槽，整页出血矩形铺满纸面 `(0,0,210,297)`：四边全部越线。
+
+```json
+{
+  "total_pages": 4,
+  "max_sheets_per_signature": 1,
+  "binding": "left",
+  "page_width_mm": 210.0,
+  "page_height_mm": 297.0,
+  "gutter_mm": 0.0,
+  "duplex_flip": "long",
+  "paper_width_mm": 420.0,
+  "paper_height_mm": 297.0,
+  "outer_trim_mm": 3.0,
+  "fold_safety_mm": 7.0,
+  "violation_count": 4,
+  "violations": [
+    {"signature_index": 1, "sheet_index": 1, "side": "front", "page": 4, "edge": "top",
+     "rectangle": {"x_mm": 0.0, "y_mm": 0.0, "width_mm": 210.0, "height_mm": 297.0}},
+    {"signature_index": 1, "sheet_index": 1, "side": "front", "page": 4, "edge": "bottom",
+     "rectangle": {"x_mm": 0.0, "y_mm": 0.0, "width_mm": 210.0, "height_mm": 297.0}},
+    {"signature_index": 1, "sheet_index": 1, "side": "front", "page": 4, "edge": "outer",
+     "rectangle": {"x_mm": 0.0, "y_mm": 0.0, "width_mm": 210.0, "height_mm": 297.0}},
+    {"signature_index": 1, "sheet_index": 1, "side": "front", "page": 4, "edge": "fold",
+     "rectangle": {"x_mm": 0.0, "y_mm": 0.0, "width_mm": 210.0, "height_mm": 297.0}}
+  ]
+}
+```
+
+### 非法参数（4xx）
+
+机台版面参数的校验与 `/api/v1/impose/press-layout` 完全一致；此外：
+
+- `outer_trim_mm` / `fold_safety_mm` 为负或非有限值；
+- **页码无效**：`page_protected[].page` 小于 1、超过 `total_pages`（或不是整数），或同一页码出现两次；
+- **矩形越出页面**：`x_mm` / `y_mm` 为负或非有限值、`width_mm` / `height_mm` 非正或非有限值、
+  `x + width > page_width_mm` 或 `y + height > page_height_mm`（矩形未完整落在页面内）；
+- 矩形/页缺字段或含未定义字段；
+
+以上均返回 `422 Unprocessable Entity`。注意：**矩形越出页内是请求错误（422）**；
+矩形在页内合法、映射纸面后越过安全线则是正常的检查结果（200 + `violations`）。
 
 ## 双面拼版校样 PDF（POST /api/v1/impose/proof.pdf）
 
@@ -1151,7 +1278,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 订针计划 + 原纸备料）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 外裁/折缝安全检查 + 订针计划 + 原纸备料）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验
